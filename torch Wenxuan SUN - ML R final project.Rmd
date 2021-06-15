@@ -15,8 +15,9 @@ When you click the **Knit** button a document will be generated that includes bo
 library(tidyverse)                          # Loading THE package/environment
 library(naniar)                             # Missing data exploration
 library(visdat)                             # Missing data visualization
-library(tseries)                                # Great package for time-series
+library(tseries)                            # Great package for time-series
 library(lubridate)
+library(zoo)
 load("data_full.RData")
 ```
 
@@ -269,7 +270,7 @@ prices_dataset <- torch::dataset(
 )
 
 # dataloader
-batch_size <- 32
+batch_size <- 16
 train_ds <- ind_dataset(ind_train, n_timesteps, sample_frac = 0.8)
 train_dl <- train_ds %>% dataloader(batch_size = batch_size, shuffle = TRUE)  # If shuffle is set to True, all the samples are shuffled and loaded in batches. Otherwise they are sent one-by-one without any shuffling
 valid_ds <- ind_dataset(ind_valid, n_timesteps, sample_frac = 0.8)
@@ -279,71 +280,8 @@ test_dl <- test_ds %>% dataloader(batch_size = 1)  # batch size=1 means that the
 ```
 
 Because CNN (convolutional neural network) falls short in interpreting the temporal information such as time series. So, for accuracy, I use Seq2seq model that consists of two RNN (recurrent neural networks): encoder and decoder.
-```{r create the seq2seq model}
-
-```
-
-seq2seq example
-https://www.r-bloggers.com/2021/03/torch-time-series-take-three-sequence-to-sequence-prediction/
-```{r vic_elec, warning=F}
-library(tsibbledata)
-library(torch)
-library(coro)
-library(tidyverse)
-library(lubridate)
-vic_elec <- tsibbledata::vic_elec
-n_timesteps <- 7 * 24 * 2  # 1 week because the data frequency is 30min
-n_forecast <- n_timesteps
-
-vic_elec_get_year <- function(year, month = NULL) {
-  vic_elec %>%
-    filter(year(Date) == year, month(Date) == if (is.null(month)) month(Date) else month) %>%
-    as_tibble() %>%
-    select(Demand)
-}
-
-elec_train <- vic_elec_get_year(2012) %>% as.matrix()
-elec_valid <- vic_elec_get_year(2013) %>% as.matrix()
-elec_test <- vic_elec_get_year(2014, 1) %>% as.matrix()
-
-train_mean <- mean(elec_train)
-train_sd <- sd(elec_train)
-
-# set up the function to convert the matrix/dataframe into torch tensor format so that torch can interpret the dataset
-elec_dataset <- torch::dataset(
-  name = "elec_dataset",
-  initialize = function(x, n_timesteps, sample_frac = 1) {
-    self$n_timesteps <- n_timesteps
-    self$x <- torch_tensor((x - train_mean) / train_sd)  # standardize the x values [-1,1]
-    n <- length(self$x) - self$n_timesteps - 1  # size of the dataset
-    self$starts <- sort(sample.int(
-      n = n,
-      size = n * sample_frac
-    ))
-  },
-  .getitem = function(i) {
-    start <- self$starts[i]
-    end <- start + self$n_timesteps - 1
-    lag <- 1
-    list(
-      x = self$x[start:end],
-      y = self$x[(start+lag):(end+lag)]$squeeze(2)
-    )
-  },
-  .length = function() {
-    length(self$starts) 
-  }
-)
-
-batch_size <- 32
-train_ds <- elec_dataset(elec_train, n_timesteps, sample_frac = 0.5)
-train_dl <- train_ds %>% dataloader(batch_size = batch_size, shuffle = TRUE)
-valid_ds <- elec_dataset(elec_valid, n_timesteps, sample_frac = 0.5)
-valid_dl <- valid_ds %>% dataloader(batch_size = batch_size)
-test_ds <- elec_dataset(elec_test, n_timesteps)
-test_dl <- test_ds %>% dataloader(batch_size = 1)  # batch size=1 means that the sample will be updated after each test
-
-# encoder module
+```{r encoder}
+# The encoder takes its input and runs it through an RNN. Of the two things returned by a recurrent neural network, outputs and state, so far we’ve only been using output. This time, we do the opposite: We throw away the outputs, and only return the state.
 encoder_module <- nn_module(
   initialize = function(type, input_size, hidden_size, num_layers = 1, dropout = 0) {
     self$type <- type
@@ -373,8 +311,11 @@ encoder_module <- nn_module(
     x
   }
 )
+```
 
-# In the decoder, just like in the encoder, the main component is an RNN. In contrast to previously-shown architectures, though, it does not just return a prediction. It also reports back the RNN’s final state.
+
+```{r decoder module}
+# In the decoder, just like in the encoder, the main component is an RNN. It returns a prediction.
 decoder_module <- nn_module(
   initialize = function(type, input_size, hidden_size, num_layers = 1) {
     self$type <- type
@@ -399,7 +340,7 @@ decoder_module <- nn_module(
     # input to forward:
     # x is (batch_size, 1, 1)
     # state is (1, batch_size, hidden_size)
-    x <- self$rnn(x, state)
+    x <- self$rnn(x)
     # break up RNN return values
     # output is (batch_size, 1, hidden_size)
     # next_hidden is
@@ -409,8 +350,10 @@ decoder_module <- nn_module(
     list(output, next_hidden)
   }
 )
+```
 
-# seq2seq module
+
+```{r seq2seq module}
 seq2seq_module <- nn_module(
   initialize = function(type, input_size, hidden_size, n_forecast, num_layers = 1, encoder_dropout = 0) {
     self$encoder <- encoder_module(type = type, input_size = input_size,
@@ -419,6 +362,7 @@ seq2seq_module <- nn_module(
                                    hidden_size = hidden_size, num_layers)
     self$n_forecast <- n_forecast
   },
+  # With teacher forcing, instead of the forecast we pass the actual ground truth, the thing the decoder should have predicted. We do that only in a configurable fraction of cases, and – naturally – only while training.
   forward = function(x, y, teacher_forcing_ratio) {
     # prepare empty output
     outputs <- torch_zeros(dim(x)[1], self$n_forecast)$to(device = device)
@@ -450,82 +394,4 @@ seq2seq_module <- nn_module(
 net <- seq2seq_module("gru", input_size = 1, hidden_size = 32, n_forecast = n_forecast)
 device <- torch_device("cpu")
 net <- net$to(device = device)
-```
-Training
-```{r training vic_elec}
-# The training procedure is mainly unchanged. We do, however, need to decide about teacher_forcing_ratio, the proportion of input sequences we want to perform re-calibration on. In valid_batch(), this should always be 0, while in train_batch(), it’s up to us (or rather, experimentation). Here, we set it to 0.3.
-optimizer <- optim_adam(net$parameters, lr = 0.001)
-num_epochs <- 15
-train_batch <- function(b, teacher_forcing_ratio) {
-  optimizer$zero_grad()
-  output <- net(b$x$to(device = device), b$y$to(device = device), teacher_forcing_ratio)
-  target <- b$y$to(device = device)
-  loss <- nnf_mse_loss(output, target)
-  loss$backward()
-  optimizer$step()
-  loss$item()
-}
-valid_batch <- function(b, teacher_forcing_ratio = 0) {
-  output <- net(b$x$to(device = device), b$y$to(device = device), teacher_forcing_ratio)
-  target <- b$y$to(device = device)
-  loss <- nnf_mse_loss(output, target)
-  loss$item()
-}
-for (epoch in 1:num_epochs) {
-  net$train()
-  train_loss <- c()
-  coro::loop(for (b in train_dl) {
-    loss <- train_batch(b, teacher_forcing_ratio = 0.3)
-    train_loss <- c(train_loss, loss)
-  })
-  cat(sprintf("\nEpoch %d, training: loss: %3.5f \n", epoch, mean(train_loss)))
-  net$eval()
-  valid_loss <- c()
-  coro::loop(for (b in valid_dl) {
-    loss <- valid_batch(b)
-    valid_loss <- c(valid_loss, loss)
-  })
-  
-  cat(sprintf("\nEpoch %d, validation: loss: %3.5f \n", epoch, mean(valid_loss)))
-}
-```
-
-```{r evaluation}
-net$eval()
-test_preds <- vector(mode = "list", length = length(test_dl))
-i <- 1
-
-coro::loop(for (b in test_dl) {
-  input <- b$x
-  output <- net(input$to(device = device))
-  preds <- as.numeric(output)
-  test_preds[[i]] <- preds
-  i <<- i + 1
-})
-
-vic_elec_jan_2014 <- vic_elec %>%
-  filter(year(Date) == 2014, month(Date) == 1)
-
-test_pred1 <- test_preds[[1]]
-test_pred1 <- c(rep(NA, n_timesteps), test_pred1, rep(NA, nrow(vic_elec_jan_2014) - n_timesteps - n_forecast))
-
-test_pred2 <- test_preds[[408]]
-test_pred2 <- c(rep(NA, n_timesteps + 407), test_pred2, rep(NA, nrow(vic_elec_jan_2014) - 407 - n_timesteps - n_forecast))
-
-test_pred3 <- test_preds[[817]]
-test_pred3 <- c(rep(NA, nrow(vic_elec_jan_2014) - n_forecast), test_pred3)
-
-preds_ts <- vic_elec_jan_2014 %>%
-  select(Demand) %>%
-  add_column(
-    mlp_ex_1 = test_pred1 * train_sd + train_mean,
-    mlp_ex_2 = test_pred2 * train_sd + train_mean,
-    mlp_ex_3 = test_pred3 * train_sd + train_mean) %>%
-  pivot_longer(-Time) %>%
-  update_tsibble(key = name)
-
-preds_ts %>%
-  autoplot() +
-  scale_colour_manual(values = c("#08c5d1", "#00353f", "#ffbf66", "#d46f4d")) +
-  theme_minimal()
 ```
