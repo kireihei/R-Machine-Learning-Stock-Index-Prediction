@@ -1,0 +1,393 @@
+---
+title: "ML R final project"
+author: "Wenxuan Sun"
+date: "07/06/2021"
+output: html_document
+---
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r}
+library(tidyverse)                          # Loading THE package/environment
+library(naniar)                             # Missing data exploration
+library(visdat)                             # Missing data visualization
+library(tseries)                                # Great package for time-series
+library(lubridate)
+load("data_full.RData")
+```
+
+Get min and max date
+```{r}
+min_date = min(data_full$Date)
+max_date = max(data_full$Date)
+```
+
+## 1. Deal with missing values
+
+Visualize the missing values
+```{r, message = F, warning = F, cache = T, fig.align='center'}
+gg_miss_var(data_full)                      # Proportion of missing points per column
+vis_dat(data_full, warn_large_data = F)     # Visualization of data types per column
+```
+
+The two most affected columns are indeed *P2B* (price-to-book) and *D2E* (debt-to-equity).   
+Let's deal with them using 2 different techniques: **times-series imputation** and **cross-sectional imputation**.   
+First, let us have a look closer.
+```{r, message = F, warning = F, fig.align='center'}
+data_full %>% filter(is.na(P2B))      # Where are the missing P2B ratios?
+data_full %>% 
+  filter(Tick == "ADX") %>%
+  ggplot(aes(x = Date, y = P2B)) + geom_line() + theme_light() + ggtitle("ADX_P2B - Adams Diversified Equity Fund")
+data_full %>% 
+  filter(Tick == "ADMT") %>%
+  ggplot(aes(x = Date, y = P2B)) + geom_line() + theme_light() + ggtitle("ADMT_P2B - ADM TRONICS UNLIMITED INC")
+```
+For time-series imputation, we will use the *na.locf* function from the zoo package. The missing points were replaced by the last preceding value. But for the situations like stock ADX, if there is no preceding value, the NA values cannot be filled.
+```{r, message = F, warning = F, fig.align='center'}
+data_full %>% 
+  group_by(Tick) %>%                         # Perform the operation for EACH stock
+  mutate(P2B = na.locf(P2B, na.rm = F)) %>%  # Replace P2B by imputed P2B
+  ungroup() %>%                              # Ungroup
+  filter(Tick == "ADX") %>% 
+  ggplot(aes(x = Date, y = P2B)) + geom_line() + theme_light() + ggtitle("ADX P2B Original")
+```
+Apparently this method does not work for certain stocks.
+
+Another way to proceed is to assign a mean or median score, as if the missing value for the company is equal to some "*average*" or representative value. The median is more robust than the mean because it is less affected by outliers.
+```{r, message = F, warning = F, fig.align='center'}
+data_full <- data_full %>% 
+  group_by(Date) %>%                                   # Perform the operation for EACH date
+  mutate(med_P2B = median(P2B, na.rm = T)) %>%         # Compute the median P2B
+  mutate(med_D2E = median(D2E, na.rm = T)) %>% 
+  mutate(med_MktCap = median(Mkt_Cap, na.rm = T)) %>% 
+  mutate(med_Vol1M = median(Vol_1M, na.rm = T)) %>% 
+  ungroup() %>% 
+  group_by(Tick) %>%                                   # Perform the operation for each stock
+  mutate(P2B = if_else(is.na(P2B), med_P2B, P2B)) %>%  # If P2B is NA, replace it! If not, don't.
+  mutate(D2E = if_else(is.na(D2E), med_D2E, D2E)) %>%
+  mutate(Mkt_Cap = if_else(is.na(Mkt_Cap), med_MktCap, Mkt_Cap)) %>%
+  mutate(Vol_1M = if_else(is.na(Vol_1M), med_Vol1M, Vol_1M)) %>%
+  select(-med_MktCap, -med_P2B, -med_D2E, -med_Vol1M) %>% 
+  ungroup()
+
+data_full %>% 
+  filter(Tick == "ADX") %>% 
+  ggplot(aes(x = Date, y = P2B)) + geom_line() + theme_light() + ggtitle("ADX_P2B - Adams Diversified Equity Fund")
+```
+
+## 2. Outlier detection (Winsorisation)
+$$\tilde{x_i}=\begin{cases}x_i,&x^{(q)}≤x_i≤x^{(1-q)} \\ x^{(q)},&x<x^{(q)} \\ x^{(1-q)}&x_i<x^{(1-q)}\end{cases}$$
+Winsorisation for P2B, D2E, Vol_1M, Mkt_Cap columns
+```{r}
+# winsorisation function
+winsor <- function(colu){
+  # the q parameter is set as 0.01
+  colu = case_when(
+    colu >= unname(quantile(colu, probs = 0.01)) & colu <= unname(quantile(colu, probs = 0.99)) ~ colu,
+    colu >= unname(quantile(colu, probs = 0.99)) ~ unname(quantile(colu, probs = 0.99)),
+    colu <= unname(quantile(colu, probs = 0.01)) ~ unname(quantile(colu, probs = 0.01))
+    )
+  return(colu)
+}
+
+data_full <- data_full %>% 
+  group_by(Date) %>% 
+  mutate_at(vars(P2B, D2E, Vol_1M, Mkt_Cap), winsor) %>% 
+  ungroup()
+
+rm(winsor)
+```
+
+## 3. Build an index
+Set up the index table (benchmark)
+The index is built with 100 USD for each stock at the beginning date 1995-01-31.
+The index at the first date is 92,800 USD and ends at 2,475,168.2 USD on 2021-02-26.
+```{r}
+data_full <- data_full %>% arrange(Date)  # arrange dates
+data_full$Date <- as.Date(data_full$Date, origin="1970-01-01")
+
+min_date <- min(data_full$Date)  # begin date
+max_date <- max(data_full$Date)  # end date
+
+c100 <- rep(100, length(data_full[data_full$Date == min_date, ]$Close))  # create a vector with length of 928 filling with 100
+
+close_1 <- data_full[data_full$Date == min_date, ]$Close # close price of 928 stocks at the beginning date
+Position <- c100 / close_1  # positions for 928 stocks
+
+# index = position * price
+index_1 <- t(Position) %*% close_1  # index at the beginning
+
+data_index <- data.frame(Date=character(), Index=numeric())  # dataframe of the index
+
+for(i in unique(data_full$Date)){
+  i <- as.Date(i, origin="1970-01-01")
+  close_i <- data_full[data_full$Date == i, ]$Close
+  index_i <- t(Position) %*% close_i
+  data_index_i <- data.frame(Date=i, Index=index_i)
+  data_index <- rbind(data_index, data_index_i)
+}
+
+# Add a return column in data_index
+data_index <- data_index %>%
+  mutate(Index_Return = Index / lag(Index) - 1)
+
+# remove variables that are useless later
+rm(c100)
+rm(close_1)
+rm(close_i)
+rm(i)
+rm(Position)
+rm(index_i)
+rm(index_1)
+rm(data_index_i)
+
+# fill in the first return data with median
+data_index$Index_Return[1] <- median(data_index$Index_Return, na.rm = T)
+print(head(data_index))
+
+data_index %>% 
+  ggplot(aes(x = Date, y = Index)) +
+  geom_line() +
+  ggtitle("Index Value")
+
+data_index %>% 
+  ggplot(aes(x = Date, y = Index_Return)) +
+  geom_line() +
+  ggtitle("Index Return")
+```
+
+## 4. Time series testing
+Stationary Testing
+```{r stationarity testing, warning=F}
+# library(tseries)  # https://cran.r-project.org/web/packages/tseries/tseries.pdf
+# Augmented Dickey-Fuller Test with null hypothesis: x is a non-stationary time series
+adf_stationary <- function(x){
+  # x must be a vector
+  if(adf.test(x)["p.value"] < 0.05){  # the confidence interval is set as 95%
+    print(paste("Under ADF test,",deparse(substitute(x)),"is stationary"))
+  } else {
+    print(paste("Under ADF test,",deparse(substitute(x)),"is not stationary"))
+  }
+}
+adf_stationary(data_index$Index)
+adf_stationary(data_index$Index_Return)
+
+# Kwiatkowski-Phillips-Schmidt-Shin (KPSS) test with the null hypothesis: x is level or trend stationary
+kpss_stationary <- function(x){
+  # x must be a vector
+  if(kpss.test(x)["p.value"] < 0.05){  # the confidence interval is set as 95%
+    print(paste("Under KPSS test,",deparse(substitute(x)),"is not stationary"))
+  } else {
+    print(paste("Under KPSS test,",deparse(substitute(x)),"is stationary"))
+  }
+}
+kpss_stationary(data_index$Index)
+kpss_stationary(data_index$Index_Return)
+rm(adf_stationary)
+rm(kpss_stationary)
+```
+Autocorrelation Testing (Ljung-Box Q Test)
+```{r autocorrelation testing, warning=F}
+# null hypothesis for LBQ test: no serial correlation under the given lag
+LBQ_acrr <- function(x, lag){
+  # x must be a vector
+  if(Box.test(x, lag = lag, type = "Ljung-Box")["p.value"] < 0.05){  # the confidence interval is set as 95%
+    print(paste("Under Ljung-Box Q test,",
+                deparse(substitute(x)),
+                "is autocorrelated under lag",
+                deparse(substitute(lag)))
+                )
+  } else {
+    print(paste("Under Ljung-Box Q test,",
+                deparse(substitute(x)),
+                "is not autocorrelated under lag",
+                deparse(substitute(lag)))
+                )
+  }
+}
+LBQ_acrr(data_index$Index, lag = 10)
+LBQ_acrr(data_index$Index_Return, lag = 10)
+rm(LBQ_acrr)
+```
+
+## 5. Apply torch algorithm
+For the input dataset of the model, the first dimension of input tensor (torch tensor: can be directly transformed from dataframe or matrix) is always the batch size. So, we need to determine training dataset, validation dataset, and test dataset first.
+
+For the input dataset of the model, the first dimension of input tensor (torch tensor: can be directly transformed from dataframe or matrix) is always the batch size.
+```{r}
+library(torch)
+n_timesteps <- 6  # 6 months
+n_forecast <- n_timesteps
+
+ind_train <- data_index %>% 
+  filter(Date < "2006-01-15") %>% 
+  select(Index) %>% 
+  as.matrix()
+ind_valid <- data_index %>% 
+  filter(Date > "2006-01-15" & Date < "2017-01-15") %>% 
+  select(Index) %>% 
+  as.matrix()
+ind_test <- data_index %>% 
+  filter(Date > "2017-01-15") %>%
+  select(Index) %>% 
+  as.matrix()
+
+train_mean <- mean(ind_train)
+train_sd <- sd(ind_train)
+
+# set up the function to convert the matrix/dataframe into torch tensor format so that torch can interpret the dataset
+prices_dataset <- torch::dataset(
+  name = "prices_dataset",  # name of the function
+  initialize = function(df) {
+    # make sure there is no NA value in the input dataset, otherwise use
+    # df <- na.omit(df) to omit NA values
+    # continuous x factors
+    x_cont <- df[,c("Mkt_Cap", "P2B", "D2E", "Vol_1M")] %>% as.matrix()
+    self$x_cont <- torch_tensor(x_cont)
+    # target data (y)
+    Close <- as.numeric(df$Close)
+    self$y <- torch_tensor(Close)
+  },
+  .getitem = function(i) {
+     list(x_cont = self$x_cont[i, ], y = self$y[i])
+  },
+  .length = function() {
+    self$y$size()[[1]]
+  }
+)
+```
+
+
+Because CNN (convolutional neural network) falls short in interpreting the temporal information such as time series. So, for accuracy, I use Seq2seq model that consists of two RNN (recurrent neural network)s: encoder and decoder.
+```{r create the seq2seq model}
+
+```
+
+seq2seq example
+https://www.r-bloggers.com/2021/03/torch-time-series-take-three-sequence-to-sequence-prediction/
+```{r vic_elec}
+library(tsibbledata)
+library(torch)
+vic_elec <- tsibbledata::vic_elec
+n_timesteps <- 7 * 24 * 2  # 1 week because the data frequency is 30min
+n_forecast <- n_timesteps
+
+vic_elec_get_year <- function(year, month = NULL) {
+  vic_elec %>%
+    filter(year(Date) == year, month(Date) == if (is.null(month)) month(Date) else month) %>%
+    as_tibble() %>%
+    select(Demand)
+}
+
+elec_train <- vic_elec_get_year(2012) %>% as.matrix()
+elec_valid <- vic_elec_get_year(2013) %>% as.matrix()
+elec_test <- vic_elec_get_year(2014, 1) %>% as.matrix()
+
+train_mean <- mean(elec_train)
+train_sd <- sd(elec_train)
+
+# set up the function to convert the matrix/dataframe into torch tensor format so that torch can interpret the dataset
+elec_dataset <- torch::dataset(
+  name = "elec_dataset",
+  initialize = function(x, n_timesteps, sample_frac = 1) {
+    self$n_timesteps <- n_timesteps
+    self$x <- torch_tensor((x - train_mean) / train_sd)  # standardize the x values [-1,1]
+    n <- length(self$x) - self$n_timesteps - 1  # size of the dataset (1D)
+    self$starts <- sort(sample.int(
+      n = n,
+      size = n * sample_frac
+    ))
+  },
+  .getitem = function(i) {
+    start <- self$starts[i]
+    end <- start + self$n_timesteps - 1
+    lag <- 1
+    list(
+      x = self$x[start:end],
+      y = self$x[(start+lag):(end+lag)]$squeeze(2)
+    )
+  },
+  .length = function() {
+    length(self$starts) 
+  }
+)
+
+batch_size <- 32
+train_ds <- elec_dataset(elec_train, n_timesteps, sample_frac = 0.5)
+train_dl <- train_ds %>% dataloader(batch_size = batch_size, shuffle = TRUE)
+valid_ds <- elec_dataset(elec_valid, n_timesteps, sample_frac = 0.5)
+valid_dl <- valid_ds %>% dataloader(batch_size = batch_size)
+test_ds <- elec_dataset(elec_test, n_timesteps)
+test_dl <- test_ds %>% dataloader(batch_size = 1)  # batch size=1 means that the sample will be updated after each test
+
+encoder_module <- nn_module(
+  initialize = function(type, input_size, hidden_size, num_layers = 1, dropout = 0) {
+    self$type <- type
+    self$rnn <- if (self$type == "gru") {
+      nn_gru(  # https://pytorch.org/docs/stable/generated/torch.nn.GRU.html
+        input_size = input_size,  # The number of expected features in the input x
+        hidden_size = hidden_size,  # The number of features in the hidden state h
+        num_layers = num_layers,
+        dropout = dropout,  # dropout probability = dropout, when dropout≠0 it will be executed
+        batch_first = TRUE  # If True, then the input and output tensors are provided as (batch, seq, feature)
+      )
+    } else {
+      nn_lstm(  # https://pytorch.org/docs/stable/generated/torch.nn.LSTM.html
+        input_size = input_size,
+        hidden_size = hidden_size,
+        num_layers = num_layers,
+        dropout = dropout,
+        batch_first = TRUE
+      )
+    }
+  },
+  forward = function(x) {
+    x <- self$rnn(x)
+    # return last states for all layers
+    # per layer, a single tensor for GRU, a list of 2 tensors for LSTM
+    x <- x[[2]]
+    x
+  }
+)
+
+# In the decoder, just like in the encoder, the main component is an RNN. In contrast to previously-shown architectures, though, it does not just return a prediction. It also reports back the RNN’s final state.
+decoder_module <- nn_module(
+  initialize = function(type, input_size, hidden_size, num_layers = 1) {
+    self$type <- type
+    self$rnn <- if (self$type == "gru") {
+      nn_gru(
+        input_size = input_size,
+        hidden_size = hidden_size,
+        num_layers = num_layers,
+        batch_first = TRUE
+      )
+    } else {
+      nn_lstm(
+        input_size = input_size,
+        hidden_size = hidden_size,
+        num_layers = num_layers,
+        batch_first = TRUE
+      )
+    }
+    self$linear <- nn_linear(hidden_size, 1)
+  },
+  forward = function(x, state) {
+    # input to forward:
+    # x is (batch_size, 1, 1)
+    # state is (1, batch_size, hidden_size)
+    x <- self$rnn(x, state)
+    # break up RNN return values
+    # output is (batch_size, 1, hidden_size)
+    # next_hidden is
+    c(output, next_hidden) %<-% x
+    output <- output$squeeze(2)
+    output <- self$linear(output)
+    list(output, next_hidden)
+  }
+)
+```
+
