@@ -223,16 +223,16 @@ library(torch)
 n_timesteps <- 6  # 6 months
 n_forecast <- n_timesteps
 
-ind_train <- data_index %>% 
-  filter(Date < "2006-01-15") %>% 
+ind_train <- data_index %>%   # training dataset
+  filter(Date < "2007-04-15") %>% 
   select(Index) %>% 
   as.matrix()
-ind_valid <- data_index %>% 
-  filter(Date > "2006-01-15" & Date < "2017-01-15") %>% 
+ind_valid <- data_index %>%   # validation dataset
+  filter(Date > "2007-04-15" & Date < "2019-07-15") %>% 
   select(Index) %>% 
   as.matrix()
-ind_test <- data_index %>% 
-  filter(Date > "2017-01-15") %>%
+ind_test <- data_index %>%   # testing dataset
+  filter(Date > "2019-07-15") %>%
   select(Index) %>% 
   as.matrix()
 
